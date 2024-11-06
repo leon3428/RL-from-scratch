@@ -1,0 +1,5 @@
+---
+lr: 0.0005
+gamma: 0.99
+episode_cnt: 4000
+seed: 0
