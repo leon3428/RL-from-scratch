@@ -1,7 +1,12 @@
 ---
-lr: 0.0005
+pi_lr: 0.0005
+vf_lr: 0.001
+train_v_iters: 80
+steps_per_epoch: 500
 gamma: 0.99
-seed: 0
+lam: 0.97
+seed: 10
 device: cpu
 log_frequency: 100
-episode_cnt: 10000
+episode_cnt: 1000
+env_cnt: 16

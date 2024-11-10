@@ -5,93 +5,157 @@ from tqdm import tqdm
 import numpy as np
 from LoggerInterface import LoggerInterface
 
+
 class VPGConfig(TypedDict):
-    lr: float
+    pi_lr: float
+    vf_lr: float
+    train_v_iters: int
+    steps_per_epoch: int
     gamma: float
+    lam: float
     seed: int
     device: str
     log_frequency: int
     episode_cnt: int
+    env_cnt: int
 
-def vpg_pseudoloss(action_log_probs: torch.Tensor, returns: torch.Tensor) -> torch.Tensor:
-    return -(action_log_probs * returns).mean()
+
+def vpg_policy_pseudoloss(action_log_probs: torch.Tensor, advantages: torch.Tensor) -> torch.Tensor:
+    return -(action_log_probs * advantages).mean()
+
+def discounted_cumsum(x: torch.Tensor, done: torch.Tensor, gamma: float):
+    ret = torch.zeros_like(x, dtype=torch.float32)
+
+    ret[:, -1] = x[:, -1]
+    for t in reversed(range(ret.shape[1] - 1)):
+        ret[:, t] = x[:, t] + (~done[:, t]) * gamma * ret[:, t+1]
+
+    return ret
+
 
 class VanillaPolicyGradient:
-    def __init__(self, env: gym.Env, policy_network: torch.nn.Module, config: VPGConfig, logger: LoggerInterface | None = None):
-        self.env = env
+    def __init__(self, envs: gym.vector.AsyncVectorEnv, policy_network: torch.nn.Module, value_network: torch.nn.Module, config: VPGConfig, logger: LoggerInterface | None = None):
+        self.envs = envs
         self.config = config
         self.logger = logger
         self.policy_network = policy_network.to(self.config['device'])
+        self.value_network = value_network.to(self.config['device'])
 
         torch.manual_seed(self.config['seed'])
         np.random.seed(self.config['seed'])
 
+        self.value_memory = []
         self.action_log_prob_memory = []
         self.reward_memory = []
+        self.done_memory = []
+        self.observation_memory = []
 
-        self.optimizer = torch.optim.Adam(self.policy_network.parameters(), self.config['lr'])
+        self.policy_optimizer = torch.optim.Adam(
+            self.policy_network.parameters(), self.config['pi_lr'])
+
+        self.value_optimizer = torch.optim.Adam(
+            self.value_network.parameters(), self.config['vf_lr'])
+
+        self.vf_loss = torch.nn.MSELoss()
 
     def train(self) -> None:
         if self.logger is not None:
-            self.logger.watch(self.policy_network, vpg_pseudoloss, self.config['log_frequency'])
+            self.logger.watch(self.policy_network,
+                              vpg_policy_pseudoloss, self.config['log_frequency'])
+
+            self.logger.watch(self.value_network,
+                              self.vf_loss, self.config['log_frequency'])
 
         for episode in tqdm(range(self.config['episode_cnt'])):
 
-            observation, _ = self.env.reset()
-            episode_done = False
-            episode_score = 0
-            episode_length = 0
-            episode_entropy = 0
+            observations, _ = self.envs.reset()
+            steps_per_epoch = self.config['steps_per_epoch']
+            batch_size = self.config['env_cnt']
 
-            while not episode_done:
-                log_prob, action, entropy = self.__choose_action(observation)
-                observation, reward, terminated, truncated, _ = self.env.step(action)
+            batch_entropy = 0
+            episodes_finished = 0
+            episode_scores = np.zeros((batch_size))
+            score_sum = 0
 
-                self.action_log_prob_memory.append(log_prob)
-                self.reward_memory.append(reward)
+            for _ in range(steps_per_epoch):
+                self.observation_memory.append(observations)
+                log_probs, actions, entropies = self.__choose_action(observations)
+                values = self.__get_values(observations)
+                observations, rewards, terminated, truncated, _ = self.envs.step(actions)
+                done = np.logical_or(terminated, truncated)
 
-                episode_done = terminated or truncated
-                episode_score += reward
-                episode_length += 1
-                episode_entropy += entropy
+                self.value_memory.append(values)
+                self.action_log_prob_memory.append(log_probs)
+                self.reward_memory.append(rewards)
+                self.done_memory.append(done)
 
-            episode_entropy /= episode_length
-            self.__learn()      
+                episode_scores += rewards
+                score_sum += np.sum(done * episode_scores)
+                episode_scores *= 1.0 - done
+                episodes_finished += np.sum(done)
+                batch_entropy += np.sum(entropies)
+
+            batch_entropy /= steps_per_epoch * batch_size
+            average_score = score_sum / episodes_finished
+            self.__learn()
 
             if self.logger is not None:
                 self.logger.log_episode_performance(episode, {
-                    'episode_length': episode_length,
-                    'episode_score': episode_score,
-                    'episode_entropy': episode_entropy
+                    'episodes_finished': episodes_finished,
+                    'average_score': average_score,
+                    'batch_entropy': batch_entropy
                 })
 
-
-    def __choose_action(self, observation: np.ndarray) -> tuple[torch.Tensor, int, float]:
-        observation_tensor = torch.from_numpy(observation).to(self.config['device'])
+    def __choose_action(self, observations: np.ndarray) -> tuple[torch.Tensor, np.ndarray, np.ndarray]:
+        observation_tensor = torch.from_numpy(
+            observations).to(self.config['device'])
         logits = self.policy_network(observation_tensor)
         dist = torch.distributions.Categorical(logits=logits)
 
-        action = dist.sample()
-        log_prob = dist.log_prob(action)
-        entropy = dist.entropy()
+        actions = dist.sample()
+        log_probs = dist.log_prob(actions)
+        entropies = dist.entropy()
 
-        return log_prob, action.detach().item(), entropy.detach().item()
-    
+        return log_probs, actions.detach().numpy(), entropies.detach().numpy()
+
+    def __get_values(self, observations: np.ndarray) -> torch.Tensor:
+        observation_tensor = torch.from_numpy(
+            observations).to(self.config['device'])
+        values = self.value_network(observation_tensor)
+
+        return values.squeeze()
+
     def __learn(self) -> None:
-        action_log_probs = torch.stack(self.action_log_prob_memory)
-        rewards = torch.tensor(self.reward_memory, dtype=torch.float32)
+        gamma = self.config['gamma']
+        lam = self.config['lam']
 
-        returns = torch.zeros_like(rewards, dtype=torch.float32)
-        returns[-1] = rewards[-1]
-        for t in range(len(rewards)-2, -1, -1):
-            returns[t] = rewards[t] + self.config['gamma'] * returns[t+1]
+        value_tensor = torch.stack(self.value_memory).T
+        reward_tensor = torch.tensor(np.array(self.reward_memory)).T
+        done_tensor = torch.tensor(np.array(self.done_memory)).T
 
-        returns = returns.to(self.config['device'])
+        detached_value_tensor = value_tensor.detach()
+        deltas = reward_tensor - detached_value_tensor
+        deltas[:, :-1] += done_tensor[:, :-1] * gamma * detached_value_tensor[:, 1:] 
+        advantage_tensor = discounted_cumsum(deltas, done_tensor, gamma*lam)
 
-        loss = vpg_pseudoloss(action_log_probs, returns)
-        loss.backward()
-        self.optimizer.step()
-        self.optimizer.zero_grad()
+        rtg = discounted_cumsum(reward_tensor, done_tensor, gamma).T.flatten().unsqueeze(1)
+    
+        log_prob_tensor = torch.stack(self.action_log_prob_memory).T
+        policy_loss = vpg_policy_pseudoloss(log_prob_tensor, advantage_tensor)
+        policy_loss.backward()
+        self.policy_optimizer.step()
+        self.policy_optimizer.zero_grad()
 
+        observation_tensor = torch.tensor(np.array(self.observation_memory)).flatten(0,1)
+        for _ in range(self.config['train_v_iters']):
+            value = self.value_network(observation_tensor)
+            value_function_loss = self.vf_loss(value, rtg)
+            value_function_loss.backward()
+            self.value_optimizer.step()
+            self.value_optimizer.zero_grad()
+
+        self.value_memory = []
         self.action_log_prob_memory = []
         self.reward_memory = []
+        self.done_memory = []
+        self.observation_memory = []
