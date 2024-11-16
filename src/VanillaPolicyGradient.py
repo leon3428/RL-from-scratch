@@ -1,161 +1,232 @@
-import gymnasium as gym
-import torch
 from typing import TypedDict
-from tqdm import tqdm
+import gymnasium as gym
+import torch.multiprocessing as mp
+import torch.distributed as dist
+from typing import Callable
+import torch
+from torch.nn.parallel import DistributedDataParallel as DDP
 import numpy as np
+import os
 from LoggerInterface import LoggerInterface
-
 
 class VPGConfig(TypedDict):
     pi_lr: float
     vf_lr: float
     train_v_iters: int
-    steps_per_epoch: int
+    steps_per_epoch_pre_worker: int
+    epoch_cnt: int
     gamma: float
     lam: float
     seed: int
     device: str
     log_frequency: int
-    episode_cnt: int
-    env_cnt: int
 
 
-def vpg_policy_pseudoloss(action_log_probs: torch.Tensor, advantages: torch.Tensor) -> torch.Tensor:
-    return -(action_log_probs * advantages).mean()
+class VPGEpochBuffer:
+    def __init__(self, steps: int, observation_dims: int):
+        self.steps = steps
+        self.len = 0
 
-def discounted_cumsum(x: torch.Tensor, done: torch.Tensor, gamma: float):
-    ret = torch.zeros_like(x, dtype=torch.float32)
+        self.observations = torch.zeros((steps, observation_dims), dtype=torch.float)
+        self.actions = torch.zeros((steps,), dtype=torch.int)
+        self.rewards = torch.zeros((steps,), dtype=torch.float)
+        self.resets = torch.zeros((steps,), dtype=torch.bool)
 
-    ret[:, -1] = x[:, -1]
-    for t in reversed(range(ret.shape[1] - 1)):
-        ret[:, t] = x[:, t] + (~done[:, t]) * gamma * ret[:, t+1]
+    def store_step(self, observation: torch.Tensor, action: int, reward: float, reset: bool) -> None:
+        assert self.len < self.steps
+
+        self.observations[self.len] = observation
+        self.actions[self.len] = action
+        self.rewards[self.len] = reward
+        self.resets[self.len] = reset
+        self.len += 1
+
+    def reset(self) -> None:
+        self.len = 0
+
+def act(actor: DDP, observation: torch.Tensor):
+    with torch.no_grad():
+        logits = actor(observation)
+
+    dist = torch.distributions.Categorical(logits=logits)
+    action = dist.sample().item()
+
+    return action
+
+def get_log_probs(actor: DDP, observations: torch.Tensor, actions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    logits = actor(observations)
+
+    dist = torch.distributions.Categorical(logits=logits)
+    log_probs = dist.log_prob(actions)
+    entorpy = dist.entropy()
+
+    return log_probs, entorpy.detach()
+
+def actor_loss(log_probs: torch.Tensor, advantages: torch.Tensor) -> torch.Tensor:
+    loss = -(log_probs * advantages).mean()
+    return loss
+
+def critic_loss(values: torch.Tensor, rtgs: torch.Tensor) -> torch.Tensor:
+    loss = ((values - rtgs)**2).mean()
+    return loss
+
+def discounted_cumsum(x: torch.Tensor, reset: torch.Tensor, gamma: float) -> torch.Tensor:
+    ret = x
+    for t in reversed(range(len(x)-1)):
+        ret[t] = (~reset[t]) * gamma * ret[t+1]
 
     return ret
 
+def normalize_epoch(x: torch.Tensor, world_size: int) -> torch.Tensor:
+    sum = x.sum()
+    sum_sq = torch.sum(x ** 2)
 
-class VanillaPolicyGradient:
-    def __init__(self, envs: gym.vector.AsyncVectorEnv, policy_network: torch.nn.Module, value_network: torch.nn.Module, config: VPGConfig, logger: LoggerInterface | None = None):
-        self.envs = envs
-        self.config = config
-        self.logger = logger
-        self.policy_network = policy_network.to(self.config['device'])
-        self.value_network = value_network.to(self.config['device'])
+    dist.all_reduce(sum, op=dist.ReduceOp.SUM)
+    dist.all_reduce(sum_sq, op=dist.ReduceOp.SUM)
 
-        torch.manual_seed(self.config['seed'])
-        np.random.seed(self.config['seed'])
+    mean = sum / (len(x) * world_size)
+    variance = sum_sq / (len(x) * world_size) - mean**2
 
-        self.value_memory = []
-        self.action_log_prob_memory = []
-        self.reward_memory = []
-        self.done_memory = []
-        self.observation_memory = []
+    return (x - mean) / torch.sqrt(variance)
 
-        self.policy_optimizer = torch.optim.Adam(
-            self.policy_network.parameters(), self.config['pi_lr'])
+def vpg_process(
+    rank: int, 
+    world_size: int, 
+    create_env: Callable[[], gym.Env], 
+    create_actor: Callable[[], torch.nn.Module], 
+    create_critic: Callable[[], torch.nn.Module], 
+    config: VPGConfig, 
+    create_logger: Callable[[dict], LoggerInterface] | None
+):
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '12355'
+    dist.init_process_group("gloo", rank=rank, world_size=world_size)
 
-        self.value_optimizer = torch.optim.Adam(
-            self.value_network.parameters(), self.config['vf_lr'])
+    env = create_env()
+    actor = DDP(create_actor()).to(config['device'])
+    critic = DDP(create_critic()).to(config['device'])
 
-        self.vf_loss = torch.nn.MSELoss()
+    logger = None
+    if rank == 0 and (create_logger is not None):
+        logger = create_logger(config)
+        logger.save_source('src/*.py') 
+        logger.watch(actor, actor_loss, config['log_frequency'])
+        logger.watch(critic, critic_loss, config['log_frequency'])
 
-    def train(self) -> None:
-        if self.logger is not None:
-            self.logger.watch(self.policy_network,
-                              vpg_policy_pseudoloss, self.config['log_frequency'])
+    actor_optimizer = torch.optim.Adam(actor.parameters(), config['pi_lr'])
+    critic_optimizer = torch.optim.Adam(critic.parameters(), config['vf_lr'])
 
-            self.logger.watch(self.value_network,
-                              self.vf_loss, self.config['log_frequency'])
+    num_steps = config['steps_per_epoch_pre_worker']
+    buffer = VPGEpochBuffer(num_steps, env.observation_space.shape[0])
 
-        for episode in tqdm(range(self.config['episode_cnt'])):
+    for epoch in range(config['epoch_cnt']):
+        #sample
 
-            observations, _ = self.envs.reset()
-            steps_per_epoch = self.config['steps_per_epoch']
-            batch_size = self.config['env_cnt']
+        score = 0
+        length = 0
 
-            batch_entropy = 0
-            episodes_finished = 0
-            episode_scores = np.zeros((batch_size))
-            score_sum = 0
+        episodes_finished = 0
+        epoch_score_sum = 0
+        epoch_length_sum = 0
 
-            for _ in range(steps_per_epoch):
-                self.observation_memory.append(observations)
-                log_probs, actions, entropies = self.__choose_action(observations)
-                values = self.__get_values(observations)
-                observations, rewards, terminated, truncated, _ = self.envs.step(actions)
-                done = np.logical_or(terminated, truncated)
+        observation, _ = env.reset()
+        observation = torch.from_numpy(observation).to(config['device'])
 
-                self.value_memory.append(values)
-                self.action_log_prob_memory.append(log_probs)
-                self.reward_memory.append(rewards)
-                self.done_memory.append(done)
+        for _ in range(num_steps):
+            action = act(actor, observation)
+            observation_, reward, terminated, truncated, _ = env.step(action)
+            reset = terminated or truncated
 
-                episode_scores += rewards
-                score_sum += np.sum(done * episode_scores)
-                episode_scores *= 1.0 - done
-                episodes_finished += np.sum(done)
-                batch_entropy += np.sum(entropies)
+            buffer.store_step(observation, action, reward, reset)
 
-            batch_entropy /= steps_per_epoch * batch_size
-            average_score = score_sum / episodes_finished
-            self.__learn()
+            score += reward
+            length += 1
 
-            if self.logger is not None:
-                self.logger.log_episode_performance(episode, {
-                    'episodes_finished': episodes_finished,
-                    'average_score': average_score,
-                    'batch_entropy': batch_entropy
-                })
+            if reset:
+                observation, _ = env.reset()
+                observation = torch.from_numpy(observation).to(config['device'])
+                epoch_score_sum += score
+                score = 0
+                epoch_length_sum += length
+                length = 0
+                episodes_finished += 1
+            else:
+                observation = torch.from_numpy(observation_).to(config['device'])
 
-    def __choose_action(self, observations: np.ndarray) -> tuple[torch.Tensor, np.ndarray, np.ndarray]:
-        observation_tensor = torch.from_numpy(
-            observations).to(self.config['device'])
-        logits = self.policy_network(observation_tensor)
-        dist = torch.distributions.Categorical(logits=logits)
+        # learn
+        with torch.no_grad():
+            values: torch.Tensor = critic(buffer.observations).squeeze()
 
-        actions = dist.sample()
-        log_probs = dist.log_prob(actions)
-        entropies = dist.entropy()
+        deltas = buffer.rewards - values
+        deltas[:-1] += (~buffer.resets[:-1]) * config['gamma'] * values[1:] 
+        advantages = discounted_cumsum(deltas, buffer.resets, config['gamma'] * config['lam'])
+        advantages = normalize_epoch(advantages, world_size)
+        rtgs = discounted_cumsum(buffer.rewards, buffer.resets, config['gamma'])
 
-        return log_probs, actions.detach().numpy(), entropies.detach().numpy()
+        log_probs, entropies = get_log_probs(actor, buffer.observations, buffer.actions)
+        actor_optimizer.zero_grad()
+        pi_loss = actor_loss(log_probs, advantages)
+        pi_loss.backward()
+        actor_optimizer.step()
 
-    def __get_values(self, observations: np.ndarray) -> torch.Tensor:
-        observation_tensor = torch.from_numpy(
-            observations).to(self.config['device'])
-        values = self.value_network(observation_tensor)
+        for _ in range(config['train_v_iters']):
+            critic_optimizer.zero_grad()
+            values = critic(buffer.observations).squeeze()
+            v_loss = critic_loss(values, rtgs)
+            v_loss.backward()
+            critic_optimizer.step()
 
-        return values.squeeze()
+        buffer.reset()
 
-    def __learn(self) -> None:
-        gamma = self.config['gamma']
-        lam = self.config['lam']
+        # logging
+        episodes_finished = torch.tensor([episodes_finished])
+        dist.reduce(episodes_finished, dst=0, op=dist.ReduceOp.SUM)
 
-        value_tensor = torch.stack(self.value_memory).T
-        reward_tensor = torch.tensor(np.array(self.reward_memory)).T
-        done_tensor = torch.tensor(np.array(self.done_memory)).T
+        epoch_score_sum = torch.tensor([epoch_score_sum])
+        dist.reduce(epoch_score_sum, dst=0, op=dist.ReduceOp.SUM)
 
-        detached_value_tensor = value_tensor.detach()
-        deltas = reward_tensor - detached_value_tensor
-        deltas[:, :-1] += done_tensor[:, :-1] * gamma * detached_value_tensor[:, 1:] 
-        advantage_tensor = discounted_cumsum(deltas, done_tensor, gamma*lam)
+        epoch_length_sum = torch.tensor([epoch_length_sum])
+        dist.reduce(epoch_length_sum, dst=0, op=dist.ReduceOp.SUM)
 
-        rtg = discounted_cumsum(reward_tensor, done_tensor, gamma).T.flatten().unsqueeze(1)
-    
-        log_prob_tensor = torch.stack(self.action_log_prob_memory).T
-        policy_loss = vpg_policy_pseudoloss(log_prob_tensor, advantage_tensor)
-        policy_loss.backward()
-        self.policy_optimizer.step()
-        self.policy_optimizer.zero_grad()
+        entropy_sum = entropies.sum()
+        dist.reduce(entropy_sum, dst=0, op=dist.ReduceOp.SUM)
 
-        observation_tensor = torch.tensor(np.array(self.observation_memory)).flatten(0,1)
-        for _ in range(self.config['train_v_iters']):
-            value = self.value_network(observation_tensor)
-            value_function_loss = self.vf_loss(value, rtg)
-            value_function_loss.backward()
-            self.value_optimizer.step()
-            self.value_optimizer.zero_grad()
+        average_score = epoch_score_sum / episodes_finished
+        average_length = epoch_length_sum / episodes_finished
+        average_entropy = entropy_sum / (config['steps_per_epoch_pre_worker'] * world_size)
+        if rank == 0 and (logger is not None):
+            logger.log_epoch_performance(epoch, {
+                'episodes_finished': episodes_finished,
+                'average_score': average_score,
+                'average_length': average_length,
+                'average_entropy': average_entropy
+            })
 
-        self.value_memory = []
-        self.action_log_prob_memory = []
-        self.reward_memory = []
-        self.done_memory = []
-        self.observation_memory = []
+        dist.barrier()
+
+    dist.destroy_process_group()
+    env.close()
+
+def vpg_train(
+    create_env: Callable[[], gym.Env], 
+    create_actor: Callable[[], torch.nn.Module], 
+    create_critic: Callable[[], torch.nn.Module], 
+    config: VPGConfig, 
+    create_logger: Callable[[dict], LoggerInterface] | None
+):
+    mp.set_start_method('spawn')
+    world_size = 8 # mp.cpu_count()
+
+    print(f"Training on {world_size} cpus")
+
+    processes: list[mp.Process] = []
+    for rank in range(world_size):
+        if rank != 0:
+            create_logger = None
+        p = mp.Process(target=vpg_process, args=(
+            rank, world_size, create_env, create_actor, create_critic, config, create_logger))
+        p.start()
+        processes.append(p)
+
+    for p in processes:
+        p.join()

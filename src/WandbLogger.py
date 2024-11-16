@@ -9,8 +9,8 @@ class WandbLogger:
     def __del__(self):
         wandb.finish()
 
-    def log_episode_performance(self, episode: int, perf: dict[str, Any]) -> None:
-        wandb.log(perf, step=episode)
+    def log_epoch_performance(self, epoch: int, perf: dict[str, Any]) -> None:
+        wandb.log(perf, step=epoch)
 
     def save_checkpoint(self, state_dict: dict[str, Any]) -> None:
         run_id = wandb.run.id
