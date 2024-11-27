@@ -1,4 +1,6 @@
 venv/
 src/__pycache__/
+test/__pycache__/
 wandb/
 models/
+.pytest_cache/

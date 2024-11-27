@@ -8,6 +8,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 import numpy as np
 import os
 from LoggerInterface import LoggerInterface
+from utils import discounted_cumsum
 
 class VPGConfig(TypedDict):
     pi_lr: float
@@ -69,13 +70,6 @@ def actor_loss(log_probs: torch.Tensor, advantages: torch.Tensor) -> torch.Tenso
 def critic_loss(values: torch.Tensor, rtgs: torch.Tensor) -> torch.Tensor:
     loss = ((values - rtgs)**2).mean()
     return loss
-
-def discounted_cumsum(x: torch.Tensor, reset: torch.Tensor, gamma: float) -> torch.Tensor:
-    ret = x
-    for t in reversed(range(len(x)-1)):
-        ret[t] = (~reset[t]) * gamma * ret[t+1]
-
-    return ret
 
 def normalize_epoch(x: torch.Tensor, world_size: int) -> torch.Tensor:
     sum = x.sum()
